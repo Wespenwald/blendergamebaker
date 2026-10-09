@@ -22,6 +22,21 @@ def _view_directions(count):
         yield Vector((math.cos(angle) * radius, y, math.sin(angle) * radius))
 
 
+def _erode_mask(mask, iterations):
+    result = mask.copy()
+    for _ in range(iterations):
+        eroded = np.zeros_like(result)
+        eroded[1:-1, 1:-1] = (
+            result[1:-1, 1:-1]
+            & result[:-2, 1:-1]
+            & result[2:, 1:-1]
+            & result[1:-1, :-2]
+            & result[1:-1, 2:]
+        )
+        result = eroded
+    return result
+
+
 def _prepare_projection_mesh(obj, depsgraph, uv_name):
     evaluated = obj.evaluated_get(depsgraph)
     evaluated_mesh = evaluated.to_mesh()
@@ -51,7 +66,19 @@ def _projection_corner_data(mesh, uv_name, matrix_world):
     return uv_values, world_normals
 
 
-def project_views(scene, obj, uv_name, resolution, views, setup_value_pass, value_channels=1):
+def project_views(
+    scene,
+    obj,
+    uv_name,
+    resolution,
+    views,
+    setup_value_pass,
+    value_channels=1,
+    robust_views=False,
+    min_facing=0.2,
+    facing_power=3,
+    silhouette_erosion=1,
+):
     depsgraph = bpy.context.evaluated_depsgraph_get()
     mesh, uv_name = _prepare_projection_mesh(obj, depsgraph, uv_name)
     _low, _high, diagonal = object_bbox(obj, depsgraph)
@@ -95,6 +122,9 @@ def project_views(scene, obj, uv_name, resolution, views, setup_value_pass, valu
     uv_values, world_normals = _projection_corner_data(mesh, uv_name, temp_obj.matrix_world)
     accumulator = np.zeros((value_channels, resolution * resolution), dtype=np.float64)
     weights = np.zeros(resolution * resolution, dtype=np.float64)
+    if robust_views:
+        view_min = np.full_like(accumulator, np.inf, dtype=np.float32)
+        view_max = np.full_like(accumulator, -np.inf, dtype=np.float32)
     attr_name = "gb_projection_uv"
     try:
         for view_index, direction in enumerate(_view_directions(max(1, views))):
@@ -137,27 +167,48 @@ def project_views(scene, obj, uv_name, resolution, views, setup_value_pass, valu
                 if os.path.exists(value_path):
                     os.remove(value_path)
 
-            alpha = uv_pixels[:, :, 3] > 0.5
+            alpha = _erode_mask(
+                uv_pixels[:, :, 3] > 0.5, silhouette_erosion
+            )
             facing_pixels = uv_pixels[:, :, 2]
-            valid = alpha & (facing_pixels >= 0.2)
+            valid = alpha & (facing_pixels >= min_facing)
             u = np.clip(uv_pixels[:, :, 0], 0.0, 0.999999)
             v = np.clip(uv_pixels[:, :, 1], 0.0, 0.999999)
             x = np.floor(u * resolution).astype(np.int32)
             y = np.floor(v * resolution).astype(np.int32)
             flat_indices = y[valid] * resolution + x[valid]
-            sample_weights = facing_pixels[valid] ** 3
-            weights += np.bincount(
+            sample_weights = facing_pixels[valid] ** facing_power
+            view_weights = np.bincount(
                 flat_indices,
                 weights=sample_weights,
                 minlength=resolution * resolution,
             )
             samples = values[:, :, :value_channels]
-            for channel in range(value_channels):
-                accumulator[channel] += np.bincount(
-                    flat_indices,
-                    weights=samples[:, :, channel][valid] * sample_weights,
-                    minlength=resolution * resolution,
-                )
+            if robust_views:
+                visible = view_weights > 0.0
+                weights[visible] += 1.0
+                for channel in range(value_channels):
+                    view_sum = np.bincount(
+                        flat_indices,
+                        weights=samples[:, :, channel][valid] * sample_weights,
+                        minlength=resolution * resolution,
+                    )
+                    view_values = view_sum[visible] / view_weights[visible]
+                    accumulator[channel, visible] += view_values
+                    view_min[channel, visible] = np.minimum(
+                        view_min[channel, visible], view_values
+                    )
+                    view_max[channel, visible] = np.maximum(
+                        view_max[channel, visible], view_values
+                    )
+            else:
+                weights += view_weights
+                for channel in range(value_channels):
+                    accumulator[channel] += np.bincount(
+                        flat_indices,
+                        weights=samples[:, :, channel][valid] * sample_weights,
+                        minlength=resolution * resolution,
+                    )
     finally:
         (
             scene.camera,
@@ -180,7 +231,16 @@ def project_views(scene, obj, uv_name, resolution, views, setup_value_pass, valu
         (resolution * resolution, value_channels), 0.5, dtype=np.float32
     )
     covered = weights > 0.0
-    result[covered] = (accumulator[:, covered] / weights[covered]).T.astype(np.float32)
+    if robust_views:
+        trimmed_weights = weights.copy()
+        trim = weights >= 3.0
+        accumulator[:, trim] -= view_min[:, trim] + view_max[:, trim]
+        trimmed_weights[trim] -= 2.0
+        result[covered] = (
+            accumulator[:, covered] / trimmed_weights[covered]
+        ).T.astype(np.float32)
+    else:
+        result[covered] = (accumulator[:, covered] / weights[covered]).T.astype(np.float32)
     return result.reshape(resolution, resolution, value_channels), covered.reshape(
         resolution, resolution
     )
@@ -212,7 +272,7 @@ def render_projection_map(scene, obj, map_item, resolution, views, uv_name=""):
         shading = value_scene.display.shading
         if map_item.map_type == "AO":
             value_scene.render.engine = "BLENDER_EEVEE"
-            value_scene.eevee.taa_render_samples = 1
+            value_scene.eevee.taa_render_samples = 16
             shading.show_cavity = False
             return
         value_scene.render.engine = "BLENDER_WORKBENCH"
@@ -237,6 +297,16 @@ def render_projection_map(scene, obj, map_item, resolution, views, uv_name=""):
             views,
             setup_value_pass,
             value_channels=1,
+            robust_views=map_item.map_type in {"AO", "CAVITY", "CURVATURE"},
+            min_facing=(
+                0.65 if map_item.map_type in {"CAVITY", "CURVATURE"} else 0.2
+            ),
+            facing_power=(
+                8 if map_item.map_type in {"CAVITY", "CURVATURE"} else 3
+            ),
+            silhouette_erosion=(
+                4 if map_item.map_type in {"CAVITY", "CURVATURE"} else 1
+            ),
         )
         result = result[:, :, 0]
         return np.clip(result, 0.0, 1.0) if map_item.map_type == "AO" else result

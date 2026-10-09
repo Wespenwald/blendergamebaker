@@ -3,6 +3,7 @@ import os
 import sys
 import time
 import traceback
+from types import SimpleNamespace
 
 import bpy
 import numpy as np
@@ -11,7 +12,9 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 
 import game_baker
+import game_baker.ui as game_baker_ui
 from game_baker.bake.common import build_flat_uv_mesh
+from game_baker.bake.post import edge_aware_median_filter
 from game_baker.bake.projection import project_views
 from game_baker.ops import _effective_cycles_device
 
@@ -159,6 +162,74 @@ def sample_face(image, obj, predicate, radius=3):
     return np.mean(sample_face_pixels(image, obj, predicate, radius), axis=0)
 
 
+def sample_flat_polygon_texels(image, obj, predicate, edge_margin=4, return_coords=False):
+    height, width = image.shape[:2]
+    polygon_ids = np.zeros((height, width), dtype=np.int32)
+    uv_layer = obj.data.uv_layers.active
+    selected_ids = []
+
+    for polygon in obj.data.polygons:
+        world_center = obj.matrix_world @ polygon.center
+        world_normal = (
+            obj.matrix_world.to_3x3().inverted_safe().transposed() @ polygon.normal
+        ).normalized()
+        if not predicate(world_center, world_normal, polygon):
+            continue
+        uvs = np.asarray(
+            [uv_layer.data[index].uv[:] for index in polygon.loop_indices],
+            dtype=np.float64,
+        )
+        x0 = max(0, int(np.floor(uvs[:, 0].min() * width)))
+        x1 = min(width, int(np.ceil(uvs[:, 0].max() * width)))
+        y0 = max(0, int(np.floor(uvs[:, 1].min() * height)))
+        y1 = min(height, int(np.ceil(uvs[:, 1].max() * height)))
+        if x0 >= x1 or y0 >= y1:
+            continue
+        x_coords = (np.arange(x0, x1) + 0.5) / width
+        y_coords = (np.arange(y0, y1) + 0.5) / height
+        xx, yy = np.meshgrid(x_coords, y_coords)
+        inside = np.zeros(xx.shape, dtype=bool)
+        for index in range(len(uvs)):
+            u1, v1 = uvs[index]
+            u2, v2 = uvs[(index + 1) % len(uvs)]
+            crosses = (v1 > yy) != (v2 > yy)
+            boundary = (u2 - u1) * (yy - v1) / (v2 - v1 + 1e-15) + u1
+            inside ^= crosses & (xx < boundary)
+        polygon_id = polygon.index + 1
+        polygon_ids[y0:y1, x0:x1][inside] = polygon_id
+        selected_ids.append(polygon_id)
+
+    coverage = image[:, :, 3] > 0.5
+    interior = np.zeros((height, width), dtype=bool)
+    for polygon_id in selected_ids:
+        polygon_mask = polygon_ids == polygon_id
+        for _ in range(edge_margin):
+            eroded = polygon_mask.copy()
+            for dy, dx in (
+                (-1, -1), (-1, 0), (-1, 1),
+                (0, -1), (0, 1),
+                (1, -1), (1, 0), (1, 1),
+            ):
+                shifted = np.roll(polygon_mask, (dy, dx), axis=(0, 1))
+                if dy < 0:
+                    shifted[-1, :] = False
+                elif dy > 0:
+                    shifted[0, :] = False
+                if dx < 0:
+                    shifted[:, -1] = False
+                elif dx > 0:
+                    shifted[:, 0] = False
+                eroded &= shifted
+            polygon_mask = eroded
+        interior |= polygon_mask
+    mask = interior & coverage
+    if not mask.any():
+        raise AssertionError("No covered texels inside the selected flat polygon")
+    if return_coords:
+        return image[mask], np.argwhere(mask)
+    return image[mask]
+
+
 def sample_ground_contact(image, obj, radius=1):
     mesh = obj.data
     ground_candidates = []
@@ -194,6 +265,124 @@ def sample_ground_contact(image, obj, radius=1):
     if not values:
         raise AssertionError("No covered texels near the ground contact")
     return np.mean(values, axis=0)
+
+
+class StubUILayout:
+    def __init__(self):
+        self.calls = []
+
+    def row(self, *args, **kwargs):
+        self.calls.append(("row", args, kwargs))
+        return self
+
+    def column(self, *args, **kwargs):
+        self.calls.append(("column", args, kwargs))
+        return self
+
+    def split(self, *args, **kwargs):
+        self.calls.append(("split", args, kwargs))
+        return self
+
+    def box(self, *args, **kwargs):
+        self.calls.append(("box", args, kwargs))
+        return self
+
+    def label(self, *args, **kwargs):
+        self.calls.append(("label", args, kwargs))
+
+    def prop(self, *args, **kwargs):
+        self.calls.append(("prop", args, kwargs))
+        return self
+
+    def prop_search(self, *args, **kwargs):
+        self.calls.append(("prop_search", args, kwargs))
+        return self
+
+    def separator(self, *args, **kwargs):
+        self.calls.append(("separator", args, kwargs))
+
+    def template_list(self, *args, **kwargs):
+        self.calls.append(("template_list", args, kwargs))
+        return self
+
+    def menu(self, *args, **kwargs):
+        self.calls.append(("menu", args, kwargs))
+        return self
+
+    def operator(self, *args, **kwargs):
+        self.calls.append(("operator", args, kwargs))
+        return self
+
+
+def test_ui_draws(settings, asset):
+    for index, map_type in enumerate(game_baker_ui.MAP_SHORT_LABELS):
+        game_baker_ui.GAMEBAKER_UL_maps.draw_item(
+            None,
+            None,
+            StubUILayout(),
+            settings,
+            SimpleNamespace(enabled=True, map_type=map_type, engine="EEVEE"),
+            None,
+            settings,
+            "maps",
+            index,
+        )
+    game_baker_ui.GAMEBAKER_UL_packs.draw_item(
+        None,
+        None,
+        StubUILayout(),
+        settings,
+        SimpleNamespace(suffix="orm"),
+        None,
+        settings,
+        "packs",
+        0,
+    )
+
+    context = SimpleNamespace(
+        scene=SimpleNamespace(game_baker=settings),
+        selected_objects=[asset],
+        view_layer=SimpleNamespace(objects=SimpleNamespace(active=asset)),
+        preferences=bpy.context.preferences,
+    )
+    original_uv_map = settings.uv_map
+    settings.uv_map = ""
+    main_layout = StubUILayout()
+    game_baker_ui.GAMEBAKER_PT_main.draw(
+        SimpleNamespace(layout=main_layout), context
+    )
+    assert any(
+        name == "label" and kwargs.get("text") == "Using active render UV"
+        for name, _args, kwargs in main_layout.calls
+    ), "Empty UV-map hint was not drawn"
+    settings.uv_map = original_uv_map
+
+    for panel in (
+        game_baker_ui.GAMEBAKER_PT_output,
+        game_baker_ui.GAMEBAKER_PT_packing,
+        game_baker_ui.GAMEBAKER_PT_advanced,
+        game_baker_ui.GAMEBAKER_PT_bake,
+    ):
+        panel.draw(SimpleNamespace(layout=StubUILayout()), context)
+
+
+def test_edge_aware_median_filter():
+    values = np.full((16, 16), 0.5, dtype=np.float32)
+    values[4:12, 4:12] = 0.6
+    values[7, 7] = 1.0
+    coverage = np.ones(values.shape, dtype=bool)
+    filtered, edge_region, filtered_region, median_reference = edge_aware_median_filter(
+        values, coverage
+    )
+    assert edge_region.any(), "Median filter did not identify an edge region"
+    assert filtered_region[7, 7], "Median filter did not identify an edge spike"
+    assert filtered[7, 7] == 0.6, "Median filter did not remove an isolated edge spike"
+    assert filtered[2, 2] == values[2, 2], "Median filter changed a flat covered texel"
+    before_residual = values[edge_region] - median_reference[edge_region]
+    after_residual = filtered[edge_region] - median_reference[edge_region]
+    assert np.std(after_residual) < np.std(before_residual), (
+        "Median filter did not reduce edge-region residual variation"
+    )
 
 
 def add_projection_texture(asset):
@@ -399,6 +588,8 @@ def run():
     item.cycles_samples = 2
     item.samples = 8
     settings.active_map_index = 0
+    test_ui_draws(settings, asset)
+    test_edge_aware_median_filter()
     for obj in bpy.context.selected_objects:
         obj.select_set(False)
     uvless.select_set(True)
@@ -432,7 +623,7 @@ def run():
         item.samples = 8
         item.cavity_ridge_factor = 1.0
         item.cavity_valley_factor = 1.0
-        item.bevel_samples = 8
+        item.bevel_samples = 16
         item.strength = 4.0
         if map_type == "CURVATURE" and engine == "CYCLES":
             item.bevel_radius = 0.2
@@ -549,6 +740,31 @@ def run():
             f"{curvature_key} edge delta {edge_delta:.6f} is not strong enough"
         )
 
+    flat_top_predicate = (
+        lambda center, normal, _poly: center.x < 1
+        and center.z > 0.9
+        and normal.z > 0.9
+    )
+    for flat_key in ("cavity_wb", "curvature_wb"):
+        flat_texels, flat_coords = sample_flat_polygon_texels(
+            images[flat_key],
+            asset,
+            flat_top_predicate,
+            edge_margin=8,
+            return_coords=True,
+        )
+        deviations = np.abs(flat_texels[:, 0] - 0.5)
+        p99_deviation = float(np.percentile(deviations, 99))
+        outlier_coords = flat_coords[deviations >= 0.05]
+        print(
+            f"PROJECTION_FLAT_TAIL {flat_key} "
+            f"p99_abs_deviation={p99_deviation:.6f} texels={len(flat_texels)} "
+            f"outliers={len(outlier_coords)} coords={outlier_coords[:24].tolist()}"
+        )
+        assert p99_deviation < 0.05, (
+            f"{flat_key} flat-face p99 deviation {p99_deviation:.6f} >= 0.05"
+        )
+
     normal_top = sample_face(
         images["normal_ws"],
         asset,
@@ -583,7 +799,7 @@ def run():
     preview_map.engine = "EEVEE"
     preview_map.suffix = "ao_preview"
     preview_map.samples = 8
-    settings.projection_views = 2
+    settings.projection_views = 12
     preview_result = bpy.ops.game_baker.bake()
     assert "FINISHED" in preview_result, f"Eevee AO preview returned {preview_result}"
     preview_path = os.path.join(OUTPUT_DIR, "TestAsset_ao_preview.png")
@@ -603,6 +819,14 @@ def run():
         asset,
         lambda center, normal, _poly: center.x < 1 and center.z > 0.9 and normal.z > 0.9,
     )[0]
+    preview_top_texels = sample_flat_polygon_texels(
+        preview_values, asset, flat_top_predicate, edge_margin=8
+    )
+    preview_flat_std = float(np.std(preview_top_texels[:, 0]))
+    print(f"PROJECTION_AO_FLAT preview_std={preview_flat_std:.6f} texels={len(preview_top_texels)}")
+    assert preview_flat_std < 0.05, (
+        f"Eevee AO-preview flat-face std {preview_flat_std:.6f} >= 0.05"
+    )
     preview_contact = sample_ground_contact(preview_values, asset)[0]
     ao_delta = preview_top - preview_contact
     print(f"PROJECTION_CONTRAST ao_preview crease_delta={ao_delta:.6f}")

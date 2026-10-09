@@ -25,7 +25,9 @@ class GAMEBAKER_UL_maps(UIList):
     bl_idname = "GAMEBAKER_UL_maps"
 
     def draw_item(self, _context, layout, _data, item, _icon, _active_data, _active_propname, _index):
-        left, right = layout.split(factor=0.62, align=True)
+        split = layout.split(factor=0.62, align=True)
+        left = split.row(align=True)
+        right = split.row(align=True)
         row = left.row(align=True)
         row.prop(item, "enabled", text="")
         icon = next((entry[3] for entry in MAPS if entry[0] == item.map_type), "TEXTURE")
@@ -83,6 +85,10 @@ class GAMEBAKER_PT_main(bpy.types.Panel):
                 text="UV Map",
                 icon="GROUP_UVS",
             )
+            if not settings.uv_map:
+                hint = layout.row()
+                hint.scale_y = 0.8
+                hint.label(text="Using active render UV", icon="INFO")
         layout.separator()
         layout.label(text="Maps")
         row = layout.row()

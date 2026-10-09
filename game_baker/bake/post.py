@@ -21,6 +21,73 @@ def downsample_covered(values, coverage, factor):
     return output, denominator > 0
 
 
+def edge_aware_median_filter(
+    values, coverage, edge_threshold=0.01, outlier_threshold=0.03, tile_size=512
+):
+    source = np.asarray(values, dtype=np.float32)
+    coverage = np.asarray(coverage, dtype=bool)
+    filtered = source.copy()
+    edge_region = np.zeros(coverage.shape, dtype=bool)
+    filtered_region = np.zeros(coverage.shape, dtype=bool)
+    median_reference = np.zeros_like(source)
+    height, width = coverage.shape
+
+    for y0 in range(0, height, tile_size):
+        y1 = min(y0 + tile_size, height)
+        sy0, sy1 = max(0, y0 - 1), min(height, y1 + 1)
+        pad_top, pad_bottom = int(y0 == 0), int(y1 == height)
+        for x0 in range(0, width, tile_size):
+            x1 = min(x0 + tile_size, width)
+            sx0, sx1 = max(0, x0 - 1), min(width, x1 + 1)
+            pad_left, pad_right = int(x0 == 0), int(x1 == width)
+            value_region = np.pad(
+                source[sy0:sy1, sx0:sx1],
+                ((pad_top, pad_bottom), (pad_left, pad_right)),
+                mode="edge",
+            )
+            coverage_region = np.pad(
+                coverage[sy0:sy1, sx0:sx1],
+                ((pad_top, pad_bottom), (pad_left, pad_right)),
+                mode="constant",
+                constant_values=False,
+            )
+            windows = np.lib.stride_tricks.sliding_window_view(
+                value_region, (3, 3)
+            ).reshape(y1 - y0, x1 - x0, 9)
+            valid_windows = np.lib.stride_tricks.sliding_window_view(
+                coverage_region, (3, 3)
+            ).reshape(y1 - y0, x1 - x0, 9)
+            local_min = np.min(np.where(valid_windows, windows, np.inf), axis=2)
+            local_max = np.max(np.where(valid_windows, windows, -np.inf), axis=2)
+            edge = coverage[y0:y1, x0:x1] & (
+                local_max - local_min > edge_threshold
+            )
+            edge_region[y0:y1, x0:x1] = edge
+            if not edge.any():
+                continue
+            ordered = np.sort(np.where(valid_windows, windows, np.inf), axis=2)
+            sample_count = valid_windows.sum(axis=2)
+            lower = np.maximum((sample_count - 1) // 2, 0)
+            upper = np.maximum(sample_count // 2, 0)
+            median = (
+                np.take_along_axis(ordered, lower[:, :, None], axis=2)[:, :, 0]
+                + np.take_along_axis(ordered, upper[:, :, None], axis=2)[:, :, 0]
+            ) * 0.5
+            median_reference[y0:y1, x0:x1] = median
+            block = filtered[y0:y1, x0:x1]
+            median_support = (
+                valid_windows
+                & (np.abs(windows - median[:, :, None]) <= outlier_threshold)
+            ).sum(axis=2)
+            outliers = edge & (np.abs(block - median) > outlier_threshold) & (
+                median_support >= 5
+            )
+            block[outliers] = median[outliers]
+            filtered_region[y0:y1, x0:x1] = outliers
+
+    return filtered, edge_region, filtered_region, median_reference
+
+
 def fill_holes(values, known, target_coverage=None):
     result = values.copy()
     known = known.copy()

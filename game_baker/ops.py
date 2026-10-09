@@ -353,6 +353,35 @@ class GAMEBAKER_OT_bake(bpy.types.Operator):
                             width = min(resolution, values.shape[1])
                             resized[:height, :width] = values[:height, :width]
                             values = resized
+                        if map_item.map_type == "CURVATURE" and map_item.engine == "CYCLES":
+                            raw_curvature = values[:, :, 0].copy()
+                            filtered, edge_region, _filtered_region, median_reference = (
+                                post.edge_aware_median_filter(
+                                    raw_curvature, values[:, :, 3] > 0.5
+                                )
+                            )
+                            if edge_region.any():
+                                before_std = float(
+                                    np.std(
+                                        raw_curvature[edge_region]
+                                        - median_reference[edge_region]
+                                    )
+                                )
+                                after_std = float(
+                                    np.std(
+                                        filtered[edge_region]
+                                        - median_reference[edge_region]
+                                    )
+                                )
+                            else:
+                                before_std = after_std = 0.0
+                            print(
+                                f"[Game Baker] {obj.name} {map_item.suffix} "
+                                f"edge_residual_std_before={before_std:.6f} "
+                                f"edge_residual_std_after={after_std:.6f} "
+                                f"edge_texels={int(edge_region.sum())}"
+                            )
+                            values[:, :, :3] = filtered[:, :, None]
                         known = values[:, :, 3] > 0.5
                         rgb = post.fill_holes(values[:, :, :3], known, coverage)
                         values[:, :, :3] = post.pad_image(rgb, coverage, settings.padding)

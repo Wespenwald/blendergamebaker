@@ -85,7 +85,7 @@ class BakeMap(bpy.types.PropertyGroup):
     cavity_ridge_factor: FloatProperty(name="Ridge", default=1.0, min=0.0, max=2.0)
     cavity_valley_factor: FloatProperty(name="Valley", default=1.0, min=0.0, max=2.0)
     bevel_radius: FloatProperty(name="Bevel Radius", default=0.0, min=0.0, soft_max=1.0, subtype="DISTANCE")
-    bevel_samples: IntProperty(name="Bevel Samples", default=8, min=1, max=64)
+    bevel_samples: IntProperty(name="Bevel Samples", default=16, min=1, max=64)
     strength: FloatProperty(name="Strength", default=4.0, min=0.0, max=32.0)
     gradient_axis: EnumProperty(name="Axis", items=GRADIENT_AXES, default="Z")
     id_source: EnumProperty(name="ID Source", items=ID_SOURCES, default="MATERIAL")
