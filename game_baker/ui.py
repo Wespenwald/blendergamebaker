@@ -17,6 +17,9 @@ MAP_SHORT_LABELS = {
 }
 
 
+ENGINE_TAGS = {"CYCLES": "Cycles", "WORKBENCH": "WB", "EEVEE": "EEVEE"}
+
+
 def _map_label(map_type):
     return MAP_SHORT_LABELS.get(map_type, map_type.title())
 
@@ -25,16 +28,14 @@ class GAMEBAKER_UL_maps(UIList):
     bl_idname = "GAMEBAKER_UL_maps"
 
     def draw_item(self, _context, layout, _data, item, _icon, _active_data, _active_propname, _index):
-        split = layout.split(factor=0.62, align=True)
-        left = split.row(align=True)
-        right = split.row(align=True)
-        row = left.row(align=True)
+        layout.use_property_split = False
+        row = layout.row(align=True)
         row.prop(item, "enabled", text="")
         icon = next((entry[3] for entry in MAPS if entry[0] == item.map_type), "TEXTURE")
-        row.label(text="", icon=icon)
-        row.label(text=_map_label(item.map_type))
-        right.alignment = "RIGHT"
-        right.label(text=item.engine.title())
+        row.label(text=_map_label(item.map_type), icon=icon)
+        tag = row.row(align=True)
+        tag.alignment = "RIGHT"
+        tag.label(text=ENGINE_TAGS.get(item.engine, item.engine.title()))
 
 
 class GAMEBAKER_UL_packs(UIList):
@@ -92,6 +93,7 @@ class GAMEBAKER_PT_main(bpy.types.Panel):
         layout.separator()
         layout.label(text="Maps")
         row = layout.row()
+        row.use_property_split = False
         row.template_list(
             "GAMEBAKER_UL_maps",
             "",
