@@ -1,0 +1,12 @@
+schema_version = "1.0.0"
+id = "game_baker"
+version = "0.1.0"
+name = "Game Baker"
+tagline = "Bake game-ready texture maps"
+maintainer = "Wespenwald"
+type = "add-on"
+blender_version_min = "5.2.0"
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+files = "Save baked textures"
