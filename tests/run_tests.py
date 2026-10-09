@@ -1,6 +1,7 @@
 import math
 import os
 import sys
+import time
 import traceback
 
 import bpy
@@ -10,6 +11,9 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 
 import game_baker
+from game_baker.bake.common import build_flat_uv_mesh
+from game_baker.bake.projection import project_views
+from game_baker.ops import _effective_cycles_device
 
 OUTPUT_DIR = os.path.join(REPO_ROOT, "tests", "output")
 MAPS = (
@@ -129,7 +133,7 @@ def read_image(path):
         bpy.data.images.remove(image)
 
 
-def sample_face(image, obj, predicate, radius=3):
+def sample_face_pixels(image, obj, predicate, radius=3):
     mesh = obj.data
     candidates = []
     for polygon in mesh.polygons:
@@ -148,7 +152,188 @@ def sample_face(image, obj, predicate, radius=3):
     covered = patch[patch[:, :, 3] > 0.5]
     if not len(covered):
         raise AssertionError(f"Expected covered texels near UV {uv}")
-    return np.mean(covered, axis=0)
+    return covered
+
+
+def sample_face(image, obj, predicate, radius=3):
+    return np.mean(sample_face_pixels(image, obj, predicate, radius), axis=0)
+
+
+def sample_ground_contact(image, obj, radius=1):
+    mesh = obj.data
+    ground_candidates = []
+    for polygon in mesh.polygons:
+        center = obj.matrix_world @ polygon.center
+        normal = (obj.matrix_world.to_3x3().inverted_safe().transposed() @ polygon.normal).normalized()
+        if abs(center.z) < 0.01 and abs(center.x) < 0.01 and abs(center.y) < 0.01 and normal.z > 0.9:
+            ground_candidates.append(polygon)
+    if not ground_candidates:
+        raise AssertionError("Ground plane polygon was not found")
+    polygon = max(ground_candidates, key=lambda entry: entry.area)
+    uv_layer = mesh.uv_layers.active
+    loop_indices = list(polygon.loop_indices)
+    local_xy = np.asarray(
+        [mesh.vertices[mesh.loops[index].vertex_index].co[:2] for index in loop_indices],
+        dtype=np.float64,
+    )
+    polygon_uvs = np.asarray([uv_layer.data[index].uv[:] for index in loop_indices], dtype=np.float64)
+    design = np.column_stack((local_xy, np.ones(len(local_xy))))
+    uv_transform, *_ = np.linalg.lstsq(design, polygon_uvs, rcond=None)
+    values = []
+    for x, y in ((0.52, 0.0), (-0.52, 0.0), (0.0, 0.52), (0.0, -0.52)):
+        uv = np.asarray((x, y, 1.0)) @ uv_transform
+        pixel_x = int(np.clip(uv[0] * image.shape[1], radius, image.shape[1] - radius - 1))
+        pixel_y = int(np.clip(uv[1] * image.shape[0], radius, image.shape[0] - radius - 1))
+        patch = image[
+            pixel_y - radius : pixel_y + radius + 1,
+            pixel_x - radius : pixel_x + radius + 1,
+        ]
+        covered = patch[patch[:, :, 3] > 0.5]
+        if len(covered):
+            values.extend(covered)
+    if not values:
+        raise AssertionError("No covered texels near the ground contact")
+    return np.mean(values, axis=0)
+
+
+def add_projection_texture(asset):
+    texture = np.empty((8, 8, 4), dtype=np.float32)
+    for y in range(8):
+        for x in range(8):
+            checker = (x + y) % 2
+            texture[y, x] = (
+                0.12 + 0.76 * x / 7.0,
+                0.12 + 0.76 * y / 7.0,
+                0.16 + 0.68 * checker,
+                1.0,
+            )
+    image = bpy.data.images.new(
+        "GB_ProjectionTestTexture", width=8, height=8, alpha=True, float_buffer=True
+    )
+    image.colorspace_settings.name = "Non-Color"
+    image.pixels.foreach_set(texture.reshape(-1))
+    for material in asset.data.materials:
+        material.use_nodes = True
+        nodes = material.node_tree.nodes
+        texture_node = nodes.new("ShaderNodeTexImage")
+        texture_node.image = image
+        texture_node.interpolation = "Closest"
+        shader = next((node for node in nodes if node.type == "BSDF_PRINCIPLED"), None)
+        if shader:
+            material.node_tree.links.new(texture_node.outputs["Color"], shader.inputs["Base Color"])
+        nodes.active = texture_node
+        if material.texture_paint_images:
+            material.paint_active_slot = 0
+    return image, texture
+
+
+def test_projection_roundtrip(asset, texture):
+    projection_scene = bpy.data.scenes.new("GB_ProjectionRoundtrip")
+
+    def setup_value_pass(scene, _temp_obj, _camera, _direction):
+        scene.render.engine = "BLENDER_WORKBENCH"
+        scene.display.shading.light = "FLAT"
+        scene.display.shading.color_type = "TEXTURE"
+        scene.display.shading.show_cavity = False
+        scene.display.shading.show_shadows = False
+
+    try:
+        values, covered = project_views(
+            projection_scene,
+            asset,
+            asset.data.uv_layers.active.name,
+            256,
+            4,
+            setup_value_pass,
+            value_channels=3,
+        )
+    finally:
+        bpy.data.scenes.remove(projection_scene)
+    rows, columns = np.indices(covered.shape)
+    source_x = np.floor((columns + 0.5) / covered.shape[1] * 8).astype(np.int32) % 8
+    source_y = np.floor((rows + 0.5) / covered.shape[0] * 8).astype(np.int32) % 8
+    expected = texture[source_y, source_x, :3]
+    error = float(np.mean(np.abs(values[covered] - expected[covered])))
+    print(f"PROJECTION_ROUNDTRIP_MAE={error:.6f} covered={int(covered.sum())}")
+    assert error < 0.02, f"Projection texture roundtrip MAE {error:.6f} >= 0.02"
+    return error
+
+
+def test_projection_performance():
+    subdivisions = 226
+    vertices = [
+        (0.0, x / (subdivisions - 1) - 0.5, y / (subdivisions - 1) - 0.5)
+        for y in range(subdivisions)
+        for x in range(subdivisions)
+    ]
+    faces = []
+    for y in range(subdivisions - 1):
+        for x in range(subdivisions - 1):
+            lower_left = y * subdivisions + x
+            lower_right = lower_left + 1
+            upper_right = lower_left + subdivisions + 1
+            upper_left = lower_left + subdivisions
+            faces.append((lower_left, lower_right, upper_right, upper_left))
+    grid_mesh = bpy.data.meshes.new("GB_PerfGrid")
+    grid_mesh.from_pydata(vertices, [], faces)
+    grid_mesh.update()
+    grid_uv = grid_mesh.uv_layers.new(name="UVMap")
+    loop_vertices = np.empty(len(grid_mesh.loops), dtype=np.int32)
+    grid_mesh.loops.foreach_get("vertex_index", loop_vertices)
+    vertex_uvs = np.asarray(
+        [
+            (x / (subdivisions - 1), y / (subdivisions - 1))
+            for y in range(subdivisions)
+            for x in range(subdivisions)
+        ],
+        dtype=np.float32,
+    )
+    grid_uv.data.foreach_set("uv", vertex_uvs[loop_vertices].reshape(-1))
+    grid_mesh.calc_loop_triangles()
+    triangle_count = len(grid_mesh.loop_triangles)
+    grid_obj = bpy.data.objects.new("GB_PerfGrid", grid_mesh)
+    bpy.context.scene.collection.objects.link(grid_obj)
+
+    build_start = time.perf_counter()
+    flat_obj, flat_mesh = build_flat_uv_mesh(
+        grid_obj, bpy.context.evaluated_depsgraph_get(), "UVMap"
+    )
+    build_seconds = time.perf_counter() - build_start
+    bpy.data.objects.remove(flat_obj, do_unlink=True)
+    bpy.data.meshes.remove(flat_mesh)
+
+    projection_scene = bpy.data.scenes.new("GB_PerfProjection")
+
+    def setup_value_pass(scene, _temp_obj, _camera, _direction):
+        scene.render.engine = "BLENDER_WORKBENCH"
+        scene.display.shading.light = "FLAT"
+        scene.display.shading.color_type = "SINGLE"
+        scene.display.shading.single_color = (0.5, 0.5, 0.5)
+        scene.display.shading.show_cavity = False
+
+    projection_start = time.perf_counter()
+    try:
+        project_views(
+            projection_scene,
+            grid_obj,
+            "UVMap",
+            64,
+            1,
+            setup_value_pass,
+            value_channels=1,
+        )
+    finally:
+        projection_seconds = time.perf_counter() - projection_start
+        bpy.data.scenes.remove(projection_scene)
+        bpy.data.objects.remove(grid_obj, do_unlink=True)
+        bpy.data.meshes.remove(grid_mesh)
+    total_seconds = build_seconds + projection_seconds
+    print(
+        f"PROJECTION_PERF triangles={triangle_count} "
+        f"flat_mesh={build_seconds:.3f}s one_view={projection_seconds:.3f}s "
+        f"total={total_seconds:.3f}s"
+    )
+    assert total_seconds <= 60.0, f"100k-triangle projection took {total_seconds:.3f}s"
 
 
 def make_contact_sheet(previews, path):
@@ -200,6 +385,10 @@ def run():
     settings.png_depth = "8"
     settings.name_pattern = "{object}_{map}"
     settings.projection_views = 12
+    assert settings.cycles_device == "GPU", "Cycles GPU is not the default"
+    cycles_addon = bpy.context.preferences.addons.get("cycles")
+    if not cycles_addon or cycles_addon.preferences.compute_device_type == "NONE":
+        assert _effective_cycles_device("GPU") == "CPU", "GPU was not disabled without a device"
     settings.cycles_device = "CPU"
     settings.auto_unwrap = True
     settings.maps.clear()
@@ -230,6 +419,9 @@ def run():
         "Auto-unwrap PNG did not reload with the saved values"
     )
 
+    _texture_image, texture = add_projection_texture(asset)
+    test_projection_roundtrip(asset, texture)
+
     settings.maps.clear()
     for map_type, suffix, engine in MAPS:
         item = settings.maps.add()
@@ -242,6 +434,8 @@ def run():
         item.cavity_valley_factor = 1.0
         item.bevel_samples = 8
         item.strength = 4.0
+        if map_type == "CURVATURE" and engine == "CYCLES":
+            item.bevel_radius = 0.2
         if map_type == "THICKNESS":
             item.distance = 0.2
     settings.active_map_index = 0
@@ -306,29 +500,35 @@ def run():
     assert thin_value < thick_value, f"thin thickness {thin_value} not darker than block {thick_value}"
 
     for cavity_key in ("cavity_wb", "cavity_cycles"):
-        flat_cavity = sample_face(
+        flat_patch = sample_face_pixels(
             images[cavity_key],
             asset,
             lambda center, normal, _poly: center.x < 1 and center.z > 0.9 and normal.z > 0.9,
-        )[0]
-        crease_cavity = sample_face(
-            images[cavity_key],
-            asset,
-            lambda center, normal, _poly: abs(center.x) < 0.45
-            and abs(center.y) < 0.45
-            and center.z < 0.02
-            and normal.z < -0.9,
-        )[0]
-        assert crease_cavity < flat_cavity, (
-            f"{cavity_key} crease {crease_cavity} not below flat {flat_cavity}"
+        )
+        flat_mean = float(np.mean(flat_patch[:, 0]))
+        flat_std = float(np.std(flat_patch[:, 0]))
+        crease_cavity = sample_ground_contact(images[cavity_key], asset)[0]
+        crease_delta = flat_mean - crease_cavity
+        print(
+            f"PROJECTION_CALIBRATION {cavity_key} flat_mean={flat_mean:.6f} "
+            f"flat_std={flat_std:.6f} crease_delta={crease_delta:.6f}"
+        )
+        assert abs(flat_mean - 0.5) <= 0.03, (
+            f"{cavity_key} flat mean {flat_mean:.6f} is not calibrated to 0.5"
+        )
+        assert flat_std < 0.03, f"{cavity_key} flat std {flat_std:.6f} is too noisy"
+        assert crease_delta > 0.05, (
+            f"{cavity_key} crease delta {crease_delta:.6f} is not strong enough"
         )
 
     for curvature_key in ("curvature_wb", "curvature_cycles"):
-        flat_curvature = sample_face(
+        flat_patch = sample_face_pixels(
             images[curvature_key],
             asset,
             lambda center, normal, _poly: center.x < 1 and center.z > 0.9 and normal.z > 0.9,
-        )[0]
+        )
+        flat_mean = float(np.mean(flat_patch[:, 0]))
+        flat_std = float(np.std(flat_patch[:, 0]))
         edge_curvature = sample_face(
             images[curvature_key],
             asset,
@@ -336,8 +536,17 @@ def run():
             and abs(normal.x) > 0.1
             and abs(normal.z) > 0.1,
         )[0]
-        assert edge_curvature > flat_curvature, (
-            f"{curvature_key} edge {edge_curvature} not above flat {flat_curvature}"
+        edge_delta = edge_curvature - flat_mean
+        print(
+            f"PROJECTION_CALIBRATION {curvature_key} flat_mean={flat_mean:.6f} "
+            f"flat_std={flat_std:.6f} edge_delta={edge_delta:.6f}"
+        )
+        assert abs(flat_mean - 0.5) <= 0.03, (
+            f"{curvature_key} flat mean {flat_mean:.6f} is not calibrated to 0.5"
+        )
+        assert flat_std < 0.03, f"{curvature_key} flat std {flat_std:.6f} is too noisy"
+        assert edge_delta > 0.05, (
+            f"{curvature_key} edge delta {edge_delta:.6f} is not strong enough"
         )
 
     normal_top = sample_face(
@@ -353,6 +562,19 @@ def run():
             sample_face(images["id"], asset, lambda _center, _normal, polygon: polygon.material_index == material_index)[:3]
         )
     assert np.linalg.norm(id_colors[0] - id_colors[1]) > 0.1, id_colors
+
+    for item in settings.maps:
+        item.enabled = item.suffix == "normal_ws"
+    settings.active_map_index = next(
+        index for index, item in enumerate(settings.maps) if item.suffix == "normal_ws"
+    )
+    rebake_result = bpy.ops.game_baker.bake()
+    assert "FINISHED" in rebake_result, f"Repeat bake returned {rebake_result}"
+    duplicates = [
+        image.name for image in bpy.data.images
+        if image.name.startswith("GB_") and ".001" in image.name
+    ]
+    assert not duplicates, f"Repeat bake created duplicate images: {duplicates}"
 
     for item in settings.maps:
         item.enabled = False
@@ -381,18 +603,15 @@ def run():
         asset,
         lambda center, normal, _poly: center.x < 1 and center.z > 0.9 and normal.z > 0.9,
     )[0]
-    preview_contact = sample_face(
-        preview_values,
-        asset,
-        lambda center, normal, _poly: abs(center.x) < 0.45
-        and abs(center.y) < 0.45
-        and center.z < 0.02
-        and normal.z < -0.9,
-    )[0]
+    preview_contact = sample_ground_contact(preview_values, asset)[0]
+    ao_delta = preview_top - preview_contact
+    print(f"PROJECTION_CONTRAST ao_preview crease_delta={ao_delta:.6f}")
     assert preview_contact < preview_top, (
         f"Eevee AO contact {preview_contact} not darker than top {preview_top}"
     )
     previews.append(("ao_preview", preview_values))
+
+    test_projection_performance()
 
     assert len(bpy.data.scenes) == scene_count, "Temporary scenes leaked"
     assert len(bpy.data.objects) == object_count, "Temporary objects leaked"

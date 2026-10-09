@@ -60,6 +60,15 @@ def _render_scene():
     return scene
 
 
+def _effective_cycles_device(requested):
+    if requested != "GPU":
+        return "CPU"
+    addon = bpy.context.preferences.addons.get("cycles")
+    if not addon or getattr(addon.preferences, "compute_device_type", "NONE") == "NONE":
+        return "CPU"
+    return "GPU"
+
+
 def _smart_unwrap_object(context, obj):
     view_layer = context.view_layer
     original_selection = list(context.selected_objects)
@@ -220,6 +229,7 @@ class GAMEBAKER_OT_bake(bpy.types.Operator):
             return {"CANCELLED"}
         resolution = int(settings.resolution)
         supersample = int(settings.supersample)
+        cycles_device = _effective_cycles_device(settings.cycles_device)
         total_steps = len(objects) * len(maps)
         step = 0
         timings = []
@@ -286,7 +296,7 @@ class GAMEBAKER_OT_bake(bpy.types.Operator):
                                 2.0 * radius,
                                 uv_name,
                                 objects,
-                                settings.cycles_device,
+                                cycles_device,
                                 radius,
                             )
                             values, mask_out = _map_texture_array(raw, coverage_hi, resolution, supersample)
@@ -314,7 +324,7 @@ class GAMEBAKER_OT_bake(bpy.types.Operator):
                                 distance,
                                 uv_name,
                                 objects,
-                                settings.cycles_device,
+                                cycles_device,
                             )
                             values, mask_out = _map_texture_array(raw, coverage_hi, resolution, supersample)
                             values[:, :, 3] = mask_out.astype(np.float32)
@@ -326,7 +336,14 @@ class GAMEBAKER_OT_bake(bpy.types.Operator):
                             values[:, :, 3] = coverage.astype(np.float32)
                         else:
                             pixels = eevee.render_attribute_map(
-                                scene, obj, flat_obj, map_item, resolution, supersample, depsgraph
+                                scene,
+                                obj,
+                                flat_obj,
+                                map_item,
+                                resolution,
+                                supersample,
+                                depsgraph,
+                                cycles_device,
                             )
                             values, mask_out = _map_texture_array(pixels, coverage_hi, resolution, supersample)
                             values[:, :, 3] = mask_out.astype(np.float32)
@@ -352,15 +369,21 @@ class GAMEBAKER_OT_bake(bpy.types.Operator):
                         wm.progress_update(step)
                     for pack in settings.packs:
                         packed = post.pack_channels(pack, raw_maps, resolution, settings.padding)
+                        extension = {
+                            "PNG": ".png",
+                            "TARGA": ".tga",
+                            "OPEN_EXR": ".exr",
+                        }[settings.file_format]
                         filepath = os.path.join(
                             bpy.path.abspath(settings.output_dir),
-                            settings.name_pattern.format(object=obj.name, map=pack.suffix) + ".png",
+                            settings.name_pattern.format(object=obj.name, map=pack.suffix)
+                            + extension,
                         )
                         image = post.save_image(
                             f"GB_{obj.name}_{pack.suffix}",
                             packed,
                             filepath,
-                            "PNG",
+                            settings.file_format,
                             settings.png_depth,
                             scene=scene,
                         )

@@ -73,7 +73,9 @@ def _map_colors(obj, flat_mesh, map_item, depsgraph):
     return np.column_stack((values, np.ones(len(values), dtype=np.float32)))
 
 
-def render_attribute_map(scene, obj, flat_obj, map_item, resolution, supersample, depsgraph):
+def render_attribute_map(
+    scene, obj, flat_obj, map_item, resolution, supersample, depsgraph, cycles_device="CPU"
+):
     mesh = flat_obj.data
     values = _map_colors(obj, mesh, map_item, depsgraph)
     color_attr = _float_color(mesh, "gb_bake_color", values)
@@ -95,7 +97,7 @@ def render_attribute_map(scene, obj, flat_obj, map_item, resolution, supersample
     scene.render.engine = "BLENDER_EEVEE" if map_item.engine == "EEVEE" else "CYCLES"
     if scene.render.engine == "CYCLES":
         scene.cycles.samples = max(1, map_item.cycles_samples)
-        scene.cycles.device = "CPU"
+        scene.cycles.device = cycles_device
     scene.eevee.taa_render_samples = 1
     scene.eevee.taa_samples = 1
     scene.render.filter_size = 0.01
@@ -107,6 +109,13 @@ def render_attribute_map(scene, obj, flat_obj, map_item, resolution, supersample
     path = os.path.join(tempfile.gettempdir(), f"gb_{map_item.map_type.lower()}.exr")
     try:
         pixels = render_pixels(scene, path)
+        if map_item.map_type in {"NORMAL_WORLD", "NORMAL_OBJECT"}:
+            normals = pixels[:, :, :3] * 2.0 - 1.0
+            lengths = np.linalg.norm(normals, axis=2, keepdims=True)
+            valid = (pixels[:, :, 3] > 0.5) & (lengths[:, :, 0] > 1e-8)
+            normalized = np.zeros_like(normals)
+            normalized[valid] = normals[valid] / lengths[valid]
+            pixels[valid, :3] = normalized[valid] * 0.5 + 0.5
         return pixels
     finally:
         if os.path.exists(path):

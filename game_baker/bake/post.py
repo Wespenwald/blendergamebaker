@@ -91,6 +91,9 @@ def image_to_array(values, coverage=None):
 
 
 def save_image(name, values, path, file_format, png_depth, scene=None):
+    existing = bpy.data.images.get(name)
+    if existing:
+        bpy.data.images.remove(existing, do_unlink=True)
     height, width, _ = values.shape
     float_buffer = file_format == "OPEN_EXR"
     image = bpy.data.images.new(name, width=width, height=height, alpha=True, float_buffer=float_buffer)

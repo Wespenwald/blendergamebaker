@@ -4,21 +4,35 @@ from bpy.types import UIList
 from .props import MAPS
 
 
+MAP_SHORT_LABELS = {
+    "AO": "AO",
+    "THICKNESS": "Thickness",
+    "CURVATURE": "Curvature",
+    "CAVITY": "Cavity",
+    "NORMAL_WORLD": "Normal WS",
+    "NORMAL_OBJECT": "Normal OS",
+    "POSITION": "Position",
+    "GRADIENT": "Gradient",
+    "ID": "ID",
+}
+
+
 def _map_label(map_type):
-    return next((label for key, label, *_ in MAPS if key == map_type), map_type.title())
+    return MAP_SHORT_LABELS.get(map_type, map_type.title())
 
 
 class GAMEBAKER_UL_maps(UIList):
     bl_idname = "GAMEBAKER_UL_maps"
 
     def draw_item(self, _context, layout, _data, item, _icon, _active_data, _active_propname, _index):
-        row = layout.row(align=True)
+        left, right = layout.split(factor=0.62, align=True)
+        row = left.row(align=True)
         row.prop(item, "enabled", text="")
         icon = next((entry[3] for entry in MAPS if entry[0] == item.map_type), "TEXTURE")
         row.label(text="", icon=icon)
         row.label(text=_map_label(item.map_type))
-        row.alignment = "RIGHT"
-        row.label(text=item.engine.title())
+        right.alignment = "RIGHT"
+        right.label(text=item.engine.title())
 
 
 class GAMEBAKER_UL_packs(UIList):
@@ -47,6 +61,8 @@ class GAMEBAKER_PT_main(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
         settings = context.scene.game_baker
         selected = [obj for obj in context.selected_objects if obj.type == "MESH"]
         layout.label(text=f"{len(selected)} mesh object{'s' if len(selected) != 1 else ''} selected")
@@ -57,11 +73,16 @@ class GAMEBAKER_PT_main(bpy.types.Panel):
             layout.label(text="Selected objects need UV maps", icon="ERROR")
         if active and active.type == "MESH":
             row = layout.row()
-            row.label(text="UV Map")
-            if active.data.uv_layers:
-                row.prop_search(settings, "uv_map", active.data, "uv_layers", text="")
-            else:
-                row.prop(settings, "uv_map", text="")
+            row.use_property_split = True
+            row.use_property_decorate = False
+            row.prop_search(
+                settings,
+                "uv_map",
+                active.data,
+                "uv_layers",
+                text="UV Map",
+                icon="GROUP_UVS",
+            )
         layout.separator()
         layout.label(text="Maps")
         row = layout.row()
@@ -72,7 +93,7 @@ class GAMEBAKER_PT_main(bpy.types.Panel):
             "maps",
             settings,
             "active_map_index",
-            rows=3,
+            rows=7,
         )
         controls = row.column(align=True)
         controls.menu("GAMEBAKER_MT_add_map", text="", icon="ADD")
@@ -87,6 +108,8 @@ class GAMEBAKER_PT_main(bpy.types.Panel):
         elif 0 <= settings.active_map_index < len(settings.maps):
             item = settings.maps[settings.active_map_index]
             box = layout.box()
+            box.use_property_split = True
+            box.use_property_decorate = False
             box.prop(item, "engine")
             box.prop(item, "suffix")
             if item.map_type in {"AO", "THICKNESS"} or (
@@ -108,14 +131,6 @@ class GAMEBAKER_PT_main(bpy.types.Panel):
                 box.prop(item, "gradient_axis")
             if item.map_type == "ID":
                 box.prop(item, "id_source")
-        layout.separator()
-        bake_row = layout.row()
-        bake_row.scale_y = 1.6
-        bake_row.operator(
-            "game_baker.bake",
-            text=f"Bake {sum(item.enabled for item in settings.maps)} Maps",
-            icon="RENDER_STILL",
-        )
 
 
 class GAMEBAKER_PT_output(bpy.types.Panel):
@@ -130,6 +145,8 @@ class GAMEBAKER_PT_output(bpy.types.Panel):
     def draw(self, context):
         settings = context.scene.game_baker
         layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
         layout.prop(settings, "resolution")
         layout.prop(settings, "supersample")
         layout.prop(settings, "padding")
@@ -152,6 +169,8 @@ class GAMEBAKER_PT_packing(bpy.types.Panel):
     def draw(self, context):
         settings = context.scene.game_baker
         layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
         row = layout.row()
         row.template_list("GAMEBAKER_UL_packs", "", settings, "packs", settings, "active_pack_index", rows=2)
         controls = row.column(align=True)
@@ -178,9 +197,38 @@ class GAMEBAKER_PT_advanced(bpy.types.Panel):
 
     def draw(self, context):
         settings = context.scene.game_baker
-        self.layout.prop(settings, "cycles_device")
-        self.layout.prop(settings, "projection_views")
-        self.layout.prop(settings, "auto_unwrap")
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        layout.prop(settings, "cycles_device")
+        cycles_addon = context.preferences.addons.get("cycles")
+        if not cycles_addon or getattr(cycles_addon.preferences, "compute_device_type", "NONE") == "NONE":
+            layout.label(text="No GPU configured; using CPU", icon="INFO")
+        layout.prop(settings, "projection_views")
+        layout.prop(settings, "auto_unwrap")
+
+
+class GAMEBAKER_PT_bake(bpy.types.Panel):
+    bl_label = "Bake"
+    bl_idname = "GAMEBAKER_PT_bake"
+    bl_parent_id = "GAMEBAKER_PT_main"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Game Baker"
+    bl_options = {"HIDE_HEADER"}
+
+    def draw(self, context):
+        settings = context.scene.game_baker
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        row = layout.row()
+        row.scale_y = 1.6
+        row.operator(
+            "game_baker.bake",
+            text=f"Bake {sum(item.enabled for item in settings.maps)} Maps",
+            icon="RENDER_STILL",
+        )
 
 
 CLASSES = (
@@ -191,6 +239,7 @@ CLASSES = (
     GAMEBAKER_PT_output,
     GAMEBAKER_PT_packing,
     GAMEBAKER_PT_advanced,
+    GAMEBAKER_PT_bake,
 )
 
 

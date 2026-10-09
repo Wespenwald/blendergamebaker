@@ -16,11 +16,6 @@ ATTRIBUTE_NAMES = {
 }
 
 
-def _corner_normals(mesh):
-    mesh.corner_normals
-    return [normal.vector.copy() for normal in mesh.corner_normals]
-
-
 def build_flat_uv_mesh(obj, depsgraph, uv_name=""):
     evaluated = obj.evaluated_get(depsgraph)
     source = evaluated.to_mesh()
@@ -29,33 +24,46 @@ def build_flat_uv_mesh(obj, depsgraph, uv_name=""):
         uv_layer = source.uv_layers.get(uv_name) if uv_name else source.uv_layers.active
         if uv_layer is None:
             raise ValueError(f"{obj.name} has no render UV map")
-        corner_normals = _corner_normals(source)
-        world = evaluated.matrix_world
-        normal_matrix = world.to_3x3().inverted_safe().transposed()
-        material_ids = []
-        world_positions = []
-        world_normals = []
-        object_positions = []
-        object_normals = []
-        uv_coords = []
-        for tri in source.loop_triangles:
-            material_ids.extend([tri.material_index] * 3)
-            for loop_index in tri.loops:
-                vertex_index = source.loops[loop_index].vertex_index
-                co = source.vertices[vertex_index].co
-                uv_coords.append(uv_layer.data[loop_index].uv[:])
-                object_positions.append(co[:])
-                world_positions.append(world @ co)
-                on = corner_normals[loop_index].normalized()
-                object_normals.append(on[:])
-                world_normals.append((normal_matrix @ on).normalized()[:])
+        triangle_count = len(source.loop_triangles)
+        triangle_loops = np.empty((triangle_count, 3), dtype=np.int32)
+        source.loop_triangles.foreach_get("loops", triangle_loops.reshape(-1))
+        triangle_loops = triangle_loops.reshape(-1)
+        triangle_materials = np.empty(triangle_count, dtype=np.int32)
+        source.loop_triangles.foreach_get("material_index", triangle_materials)
+        triangle_polygons = np.empty(triangle_count, dtype=np.int32)
+        source.loop_triangles.foreach_get("polygon_index", triangle_polygons)
 
-        verts = [(uv[0], uv[1], 0.0) for uv in uv_coords]
-        faces = [(i, i + 1, i + 2) for i in range(0, len(verts), 3)]
+        loop_vertices = np.empty(len(source.loops), dtype=np.int32)
+        source.loops.foreach_get("vertex_index", loop_vertices)
+        vertex_indices = loop_vertices[triangle_loops]
+        uv_values = np.empty((len(uv_layer.data), 2), dtype=np.float32)
+        uv_layer.data.foreach_get("uv", uv_values.reshape(-1))
+        uv_coords = uv_values[triangle_loops]
+        vertex_positions = np.empty((len(source.vertices), 3), dtype=np.float32)
+        source.vertices.foreach_get("co", vertex_positions.reshape(-1))
+        object_positions = vertex_positions[vertex_indices]
+        local_normals = np.empty((len(source.corner_normals), 3), dtype=np.float32)
+        source.corner_normals.foreach_get("vector", local_normals.reshape(-1))
+        object_normals = local_normals[triangle_loops]
+        object_normals /= np.maximum(
+            np.linalg.norm(object_normals, axis=1, keepdims=True), 1e-12
+        )
+
+        matrix = np.asarray(evaluated.matrix_world, dtype=np.float64)
+        normal_matrix = np.asarray(
+            evaluated.matrix_world.to_3x3().inverted_safe().transposed(), dtype=np.float64
+        )
+        world_positions = object_positions @ matrix[:3, :3].T + matrix[:3, 3]
+        world_normals = object_normals @ normal_matrix.T
+        world_normals /= np.maximum(np.linalg.norm(world_normals, axis=1, keepdims=True), 1e-12)
+        material_ids = np.repeat(triangle_materials, 3)
+        polygon_ids = np.repeat(triangle_polygons, 3)
+        flat_vertices = np.column_stack((uv_coords, np.zeros(len(uv_coords), dtype=np.float32)))
+        faces = np.arange(len(flat_vertices), dtype=np.int32).reshape(-1, 3)
         mesh = bpy.data.meshes.new(f"GB_Flat_{obj.name}")
-        mesh.from_pydata(verts, [], faces)
+        mesh.from_pydata(flat_vertices, [], faces)
         mesh.update()
-        mesh.polygons.foreach_set("material_index", material_ids[::3])
+        mesh.polygons.foreach_set("material_index", triangle_materials)
         uv = mesh.uv_layers.new(name="GameBakerUV")
         uv.data.foreach_set("uv", np.asarray(uv_coords, dtype=np.float32).reshape(-1))
         _new_vector_attribute(mesh, ATTRIBUTE_NAMES["world_position"], world_positions)
@@ -64,22 +72,24 @@ def build_flat_uv_mesh(obj, depsgraph, uv_name=""):
         _new_vector_attribute(mesh, ATTRIBUTE_NAMES["object_normal"], object_normals)
         mat_attr = mesh.attributes.new(ATTRIBUTE_NAMES["material_index"], "FLOAT", "POINT")
         mat_attr.data.foreach_set("value", np.asarray(material_ids, dtype=np.float32))
-        ids = _material_id_colors(material_ids, len(obj.material_slots))
+        palette = np.asarray(
+            [_hsv_color(i) for i in range(max(1, len(obj.material_slots)))],
+            dtype=np.float32,
+        )
+        ids = palette[material_ids % len(palette)]
         id_attr = mesh.attributes.new(ATTRIBUTE_NAMES["id_color"], "FLOAT_COLOR", "POINT")
         id_attr.data.foreach_set("color", np.asarray(ids, dtype=np.float32).reshape(-1))
         color_source = source.color_attributes.active_color
         if color_source:
-            color_ids = []
-            for tri in source.loop_triangles:
-                for loop_index in tri.loops:
-                    vertex_index = source.loops[loop_index].vertex_index
-                    if color_source.domain == "POINT":
-                        color_index = vertex_index
-                    elif color_source.domain == "FACE":
-                        color_index = tri.polygon_index
-                    else:
-                        color_index = loop_index
-                    color_ids.append(color_source.data[color_index].color[:])
+            source_colors = np.empty((len(color_source.data), 4), dtype=np.float32)
+            color_source.data.foreach_get("color", source_colors.reshape(-1))
+            if color_source.domain == "POINT":
+                color_indices = vertex_indices
+            elif color_source.domain == "FACE":
+                color_indices = polygon_ids
+            else:
+                color_indices = triangle_loops
+            color_ids = source_colors[color_indices]
             color_attr = mesh.attributes.new(ATTRIBUTE_NAMES["color_id"], "FLOAT_COLOR", "POINT")
             color_attr.data.foreach_set("color", np.asarray(color_ids, dtype=np.float32).reshape(-1))
         flat_obj = bpy.data.objects.new(f"GB_Flat_{obj.name}", mesh)

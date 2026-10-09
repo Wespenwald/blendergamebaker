@@ -122,7 +122,7 @@ class GameBakerSettings(bpy.types.PropertyGroup):
     png_depth: EnumProperty(name="PNG Bit Depth", items=(("8", "8-bit", ""), ("16", "16-bit", "")), default="8")
     name_pattern: StringProperty(name="Name Pattern", default="{object}_{map}")
     cycles_device: EnumProperty(
-        name="Cycles Device", items=(("CPU", "CPU", ""), ("GPU", "GPU", "")), default="CPU"
+        name="Cycles Device", items=(("CPU", "CPU", ""), ("GPU", "GPU", "")), default="GPU"
     )
     auto_unwrap: BoolProperty(name="Auto-unwrap objects without UVs", default=True)
     projection_views: IntProperty(name="Projection Views", default=42, min=1, max=512)
